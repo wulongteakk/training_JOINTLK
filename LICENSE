@@ -1,0 +1,16 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"> 
+<html xmlns="http://www.w3.org/1999/xhtml"> 
+<head> 
+<meta http-equiv="Content-Type" content="text/html; charset=gb2312">
+<meta id="viewport" name="viewport" content="target-densitydpi=device-dpi,width=640px,user-scalable=1">
+<meta name="renderer" content="webkit" />
+<meta http-equiv="X-UA-Compatible" content="IE=9; IE=8; IE=7; IE=EDGE">
+<title>上网登录页</title> 
+<!--Dr.COMWebLoginID_0.htm-->
+
+<script type="text/javascript">
+sv=1;sv1=0;v6='http://[2001:da8:c800:ffff::f012]:9002/v6               ';myv6ip='                                       ';v4serip='10.10.8.162'    ;m46=0;v46ip='172.18.76.110'                          ;
+vid=0   ;mip=172018076110;Gno=0000;vlanid="0"   ;AC="";                          ipm="0a0a08a2";ss1="0010f380ee92";ss2="0000";ss3="ac124c6e";ss4="000000000000";ss5="172.18.76.110"  ;ss6="10.10.8.162"    ;timet=1762146096; 
+osele=0;//1=不弹窗
+domain='[2001:da8:c800:ffff::f012]';// //////////////////
+zxopt=0;//1为普通，8为直通(需2
