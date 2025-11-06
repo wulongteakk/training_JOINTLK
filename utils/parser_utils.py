@@ -1,4 +1,6 @@
 import argparse
+from typing import Any, Dict
+
 from utils.utils import *
 from modeling.modeling_encoder import MODEL_NAME_TO_CLASS
 
@@ -21,18 +23,23 @@ ENCODER_DEFAULT_LR = {
     'medqa_usmle': {
         'cambridgeltl/SapBERT-from-PubMedBERT-fulltext': 5e-5,
     },
+    'construction': {
+        'bert-base-chinese': 2e-5,
+        'hfl/chinese-roberta-wwm-ext': 1e-5,
+    },
 }
 
-DATASET_LIST = ['csqa', 'obqa', 'socialiqa', 'medqa_usmle']
+DATASET_LIST = ['csqa', 'obqa', 'socialiqa', 'medqa_usmle',"construction"]
 
 DATASET_SETTING = {
     'csqa': 'inhouse',
     'obqa': 'official',
     'socialiqa': 'official',
     'medqa_usmle': 'official',
+    'construction': 'official',
 }
 
-DATASET_NO_TEST = ['socialiqa']
+DATASET_NO_TEST = ['socialiqa', 'construction']
 
 EMB_PATHS = {
     'transe': 'data/transe/glove.transe.sgd.ent.npy',
@@ -40,12 +47,23 @@ EMB_PATHS = {
     'numberbatch': 'data/transe/concept.nb.npy',
     'tzw': 'data/cpnet/tzw.ent.npy',
     'ddb': 'data/ddb/ent_emb.npy',
+    ""
 }
 
+DATASET_OVERRIDES = {
+    'construction': {
+        'ent_emb_paths': ['data/ent_emb.npy'],
+        'question_path': 'data/construction_qa_intermediate.jsonl',
+        'grounding_vocab': 'data/entity_vocab.txt',
+        'entity_vocab_path': 'data/entity_vocab.txt',
+        'load_model_path': 'saved_models/csqa/csqa.model.pt.dev_77.6-test_75.3',
+    },
+}
 
 def add_data_arguments(parser):
     # arguments that all datasets share
-    parser.add_argument('--ent_emb', default=['tzw'], nargs='+', help='sources for entity embeddings')
+    parser.add_argument('--ent_emb', default=['tzw'], nargs='+',
+                        help='sources for entity embeddings or direct npy paths')
     # dataset specific
     parser.add_argument('-ds', '--dataset', default='csqa', choices=DATASET_LIST, help='dataset name')
     parser.add_argument('-ih', '--inhouse', type=bool_flag, nargs='?', const=True, help='run in-house setting')
@@ -58,7 +76,19 @@ def add_data_arguments(parser):
     parser.add_argument('-sl', '--max_seq_len', default=100, type=int)
     # set dataset defaults
     args, _ = parser.parse_known_args()
-    parser.set_defaults(ent_emb_paths=[EMB_PATHS.get(s) for s in args.ent_emb],
+    ent_emb_paths = []
+    default_ent_sources = parser.get_default('ent_emb')
+    for source in args.ent_emb:
+        if source in EMB_PATHS:
+            ent_emb_paths.append(EMB_PATHS[source])
+        else:
+            ent_emb_paths.append(source)
+
+    dataset_overrides = DATASET_OVERRIDES.get(args.dataset, {})
+    if args.ent_emb == default_ent_sources and 'ent_emb_paths' in dataset_overrides:
+        ent_emb_paths = dataset_overrides['ent_emb_paths']
+
+    parser.set_defaults(ent_emb_paths=ent_emb_paths,
                         inhouse=(DATASET_SETTING[args.dataset] == 'inhouse'),
                         inhouse_train_qids=args.inhouse_train_qids.format(dataset=args.dataset))
     data_splits = ('train', 'dev') if args.dataset in DATASET_NO_TEST else ('train', 'dev', 'test')
@@ -69,6 +99,11 @@ def add_data_arguments(parser):
     if 'test' not in data_splits:
         parser.set_defaults(test_statements=None)
 
+        for key, value in dataset_overrides.items():
+            parser.set_defaults(**{key: value})
+
+def get_dataset_overrides(dataset: str) -> Dict[str, Any]:
+    return DATASET_OVERRIDES.get(dataset, {})
 
 def add_encoder_arguments(parser):
     parser.add_argument('-enc', '--encoder', default='bert-large-uncased', help='encoder type')
