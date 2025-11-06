@@ -26,16 +26,15 @@ print ("conda env:", os.environ['CONDA_DEFAULT_ENV'])
 print ("screen: %s" % subprocess.check_output('echo $STY', shell=True).decode('utf'))
 print ("gpu: %s" % subprocess.check_output('echo $CUDA_VISIBLE_DEVICES', shell=True).decode('utf'))
 
+def contrastive_alignment_loss(graph_vecs, sent_vecs, temperature: float) -> torch.Tensor:
+    graph_vecs = F.normalize(graph_vecs, dim=-1)
+    sent_vecs = F.normalize(sent_vecs, dim=-1)
+    logits = torch.matmul(graph_vecs, sent_vecs.t()) / temperature
+    labels = torch.arange(logits.size(0), device=logits.device)
 
-def evaluate_accuracy(eval_set, model):
-    n_samples, n_correct = 0, 0
-    model.eval()
-    with torch.no_grad():
-        for qids, labels, *input_data in tqdm(eval_set):
-            logits, _ = model(*input_data)
-            n_correct += (logits.argmax(1) == labels).sum().item()
-            n_samples += labels.size(0)
-    return n_correct / n_samples
+    loss_i = F.cross_entropy(logits, labels)
+    loss_j = F.cross_entropy(logits.t(), labels)
+    return 0.5 * (loss_i + loss_j)
 
 
 def main():
@@ -53,6 +52,21 @@ def main():
     parser.add_argument('--dev_adj', default=f'data/{args.dataset}/graph/dev.graph.adj.pk')
     parser.add_argument('--test_adj', default=f'data/{args.dataset}/graph/test.graph.adj.pk')
     parser.add_argument('--use_cache', default=True, type=bool_flag, nargs='?', const=True, help='use cached data to accelerate data loading')
+
+    parser.add_argument('--question_path', required=True, help='Path to the jsonl file that stores questions only.')
+    parser.add_argument('--grounding_vocab', required=True, help='Entity vocabulary used for grounding mentions in the question.')
+    parser.add_argument('--entity_vocab_path', required=True, help='Vocabulary that matches the rows of the entity embedding matrix.')
+    parser.add_argument('--node_type_mapping', required=True, help='JSON file that maps Neo4j node labels to integer IDs.')
+    parser.add_argument('--edge_type_mapping', required=True, help='JSON file that maps Neo4j relation types to integer IDs.')
+    parser.add_argument('--neo4j_uri', required=True, help='Neo4j connection URI.')
+    parser.add_argument('--neo4j_user', required=True, help='Neo4j username.')
+    parser.add_argument('--neo4j_password', required=True, help='Neo4j password.')
+    parser.add_argument('--neo4j_hop', default=1, type=int, help='Maximum number of hops to expand when retrieving subgraphs.')
+    parser.add_argument('--entity_name_key', default='name', help='Node property that stores the surface form used in the vocabulary.')
+    parser.add_argument('--node_score_key', default='score', help='Node property that is used to initialise node_scores.')
+    parser.add_argument('--context_edge_type', default='context_to_entity', help='Synthetic relation type that links the context node to grounded entities.')
+    parser.add_argument('--contrastive_tau', default=0.2, type=float, help='Temperature for the contrastive alignment loss.')
+    parser.add_argument('--custom_ent_emb_paths', nargs='+', default=None, help='Optional list of npy files that override --ent_emb.')
 
     # model architecture
     parser.add_argument('-k', '--k', default=5, type=int, help='perform k-layer message passing')
@@ -88,6 +102,8 @@ def main():
     if args.simple:
         parser.set_defaults(k=1)
     args = parser.parse_args()
+    if args.custom_ent_emb_paths is not None:
+        args.ent_emb_paths = args.custom_ent_emb_paths
     args.fp16 = args.fp16 and (torch.__version__ >= '1.6.0')
 
     if args.mode == 'train':
@@ -116,7 +132,7 @@ def train(args):
     export_config(args, config_path)
     check_path(model_path)
     with open(log_path, 'w') as fout:
-        fout.write('step,dev_acc,test_acc\n')
+        fout.write('step,train_loss\n')
 
     ###################################################################################################
     #   Load data                                                                                     #
@@ -138,21 +154,37 @@ def train(args):
         else:
             device0 = torch.device("cpu")
             device1 = torch.device("cpu")
-        dataset = DataLoader(args, args.train_statements, args.train_adj,
-                                               args.dev_statements, args.dev_adj,
-                                               args.test_statements, args.test_adj,
-                                               batch_size=args.batch_size, eval_batch_size=args.eval_batch_size,
-                                               device=(device0, device1),
-                                               model_name=args.encoder,
-                                               max_node_num=args.max_node_num, max_seq_length=args.max_seq_len,
-                                               is_inhouse=args.inhouse, inhouse_train_qids_path=args.inhouse_train_qids,
-                                               subsample=args.subsample, use_cache=args.use_cache)
+        dataset = DataLoader(
+            args,
+            question_path=args.question_path,
+            grounding_vocab_path=args.grounding_vocab,
+            entity_vocab_path=args.entity_vocab_path,
+            node_type_mapping_path=args.node_type_mapping,
+            edge_type_mapping_path=args.edge_type_mapping,
+            neo4j_config={
+                'uri': args.neo4j_uri,
+                'user': args.neo4j_user,
+                'password': args.neo4j_password,
+            },
+            batch_size=args.batch_size,
+            eval_batch_size=args.eval_batch_size,
+            device=(device0, device1),
+            model_name=args.encoder,
+            max_node_num=args.max_node_num,
+            max_seq_length=args.max_seq_len,
+            hops=args.neo4j_hop,
+            entity_name_key=args.entity_name_key,
+            node_score_key=args.node_score_key,
+            context_edge_type=args.context_edge_type,
+        )
 
         ###################################################################################################
         #   Build model                                                                                   #
         ###################################################################################################
-        print ('args.num_relation', args.num_relation)
-        model = JOINT_LM_KG(args, args.encoder, k=args.k, n_ntype=4, n_etype=args.num_relation, n_concept=concept_num,
+        args.num_relation = len(dataset.edge_type_mapping)
+        n_ntype = len(dataset.node_type_mapping)
+        print('args.num_relation', args.num_relation)
+        model = JOINT_LM_KG(args, args.encoder, k=args.k, n_ntype=n_ntype, n_etype=args.num_relation, n_concept=concept_num,
                                    concept_dim=args.gnn_dim,
                                    concept_in_dim=concept_dim,
                                    n_attention_head=args.att_head_num, fc_dim=args.fc_dim, n_fc_layer=args.fc_layer_num,
@@ -215,23 +247,7 @@ def train(args):
     num_params = sum(p.numel() for p in model.decoder.parameters() if p.requires_grad)
     print('\ttotal:', num_params)
 
-    if args.loss == 'margin_rank':
-        loss_func = nn.MarginRankingLoss(margin=0.1, reduction='mean')
-    elif args.loss == 'cross_entropy':
-        loss_func = nn.CrossEntropyLoss(reduction='mean')
 
-    def compute_loss(logits, labels):
-        if args.loss == 'margin_rank':
-            num_choice = logits.size(1)
-            flat_logits = logits.view(-1)
-            correct_mask = F.one_hot(labels, num_classes=num_choice).view(-1)  # of length batch_size*num_choice
-            correct_logits = flat_logits[correct_mask == 1].contiguous().view(-1, 1).expand(-1, num_choice - 1).contiguous().view(-1)  # of length batch_size*(num_choice-1)
-            wrong_logits = flat_logits[correct_mask == 0]
-            y = wrong_logits.new_ones((wrong_logits.size(0),))
-            loss = loss_func(correct_logits, wrong_logits, y)  # margin ranking loss
-        elif args.loss == 'cross_entropy':
-            loss = loss_func(logits, labels)
-        return loss
 
     ###################################################################################################
     #   Training                                                                                      #
@@ -242,202 +258,113 @@ def train(args):
     if args.fp16:
         print ('Using fp16 training')
         scaler = torch.cuda.amp.GradScaler()
-
-    global_step, best_dev_epoch = 0, 0
-    best_dev_acc, final_test_acc, total_loss = 0.0, 0.0, 0.0
+    else:
+        scaler = None
+    global_step = 0
+    total_loss = 0.0
     start_time = time.time()
-    model.train()
+
     freeze_net(model.encoder)
-    if True:
-    # try:
-        for epoch_id in range(args.n_epochs):
-            if epoch_id == args.unfreeze_epoch:
-                unfreeze_net(model.encoder)
-            if epoch_id == args.refreeze_epoch:
-                freeze_net(model.encoder)
-            model.train()
-            for qids, labels, *input_data in dataset.train():
-                optimizer.zero_grad()
-                bs = labels.size(0)
-                for a in range(0, bs, args.mini_batch_size):
-                    b = min(a + args.mini_batch_size, bs)
-                    if args.fp16:
-                        with torch.cuda.amp.autocast():
-                            logits, _ = model(*[x[a:b] for x in input_data], layer_id=args.encoder_layer)
-                            loss = compute_loss(logits, labels[a:b])
-                    else:
-                        logits, _ = model(*[x[a:b] for x in input_data], layer_id=args.encoder_layer)
-                        loss = compute_loss(logits, labels[a:b])
+    for epoch_id in range(args.n_epochs):
+        if epoch_id == args.unfreeze_epoch:
+            unfreeze_net(model.encoder)
+        if epoch_id == args.refreeze_epoch:
+            freeze_net(model.encoder)
 
-                    # logging.info("loss: ", loss)
+        model.train()
+        epoch_loss = 0.0
+        num_batches = 0
 
-                    loss = loss * (b - a) / bs
-                    # print("qids: ", qids)
-                    # print("logits: ", logits)
+        for (
+                qids,
+                input_ids,
+                attention_mask,
+                token_type_ids,
+                output_mask,
+                concept_ids,
+                node_type_ids,
+                node_scores,
+                adj_lengths,
+                edge_index,
+                edge_type,
+        ) in dataset.train():
 
-                    # print("loss {:7.4f} ".format(loss))
-                    # assert str(loss)!='nan'
-                    # logging.info("loss * (b - a) / bs: ", loss, (b - a) / bs)
-                    if args.fp16:
-                        scaler.scale(loss).backward()
-                    else:
-                        loss.backward()
-                    total_loss += loss.item()
-                if args.max_grad_norm > 0:
-                    if args.fp16:
+            optimizer.zero_grad()
+            model_inputs = [
+                input_ids,
+                attention_mask,
+                token_type_ids,
+                output_mask,
+                concept_ids,
+                node_type_ids,
+                node_scores,
+                adj_lengths,
+                edge_index,
+                edge_type,
+            ]
+
+            if args.fp16:
+                with torch.cuda.amp.autocast():
+                    reps, _, graph_vecs, sent_vecs = model(*model_inputs, layer_id=args.encoder_layer)
+                    graph_vecs = graph_vecs.squeeze(1)
+                    sent_vecs = sent_vecs.squeeze(1)
+                    loss = contrastive_alignment_loss(graph_vecs, sent_vecs, args.contrastive_tau)
+            else:
+                reps, _, graph_vecs, sent_vecs = model(*model_inputs, layer_id=args.encoder_layer)
+                graph_vecs = graph_vecs.squeeze(1)
+                sent_vecs = sent_vecs.squeeze(1)
+                loss = contrastive_alignment_loss(graph_vecs, sent_vecs, args.contrastive_tau)
+                if args.fp16:
+                    scaler.scale(loss).backward()
+                    if args.max_grad_norm > 0:
                         scaler.unscale_(optimizer)
                         nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                    else:
-                        nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                scheduler.step()
-                if args.fp16:
                     scaler.step(optimizer)
                     scaler.update()
                 else:
+                    loss.backward()
+                    if args.max_grad_norm > 0:
+                        nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                     optimizer.step()
 
-                if (global_step + 1) % args.log_interval == 0:
-                    total_loss /= args.log_interval
-                    ms_per_batch = 1000 * (time.time() - start_time) / args.log_interval
-                    print('| step {:5} |  lr: {:9.7f} | loss {:7.4f} | ms/batch {:7.2f} |'.format(global_step, scheduler.get_lr()[0], total_loss, ms_per_batch))
-                    total_loss = 0
-                    start_time = time.time()
+                scheduler.step()
+
+                batch_loss = loss.item()
+                epoch_loss += batch_loss
+                total_loss += batch_loss
+                num_batches += 1
                 global_step += 1
 
-            model.eval()
-            dev_acc = evaluate_accuracy(dataset.dev(), model)
-            save_test_preds = args.save_model
-            if not save_test_preds:
-                test_acc = evaluate_accuracy(dataset.test(), model) if args.test_statements else 0.0
-            else:
-                eval_set = dataset.test()
-                total_acc = []
-                count = 0
-                preds_path = os.path.join(args.save_dir, 'test_e{}_preds.csv'.format(epoch_id))
-                with open(preds_path, 'w') as f_preds:
-                    with torch.no_grad():
-                        for qids, labels, *input_data in tqdm(eval_set):
-                            count += 1
-                            logits, _, concept_ids, node_type_ids, edge_index, edge_type = model(*input_data, detail=True)
-                            predictions = logits.argmax(1) #[bsize, ]
-                            preds_ranked = (-logits).argsort(1) #[bsize, n_choices]
-                            for i, (qid, label, pred, _preds_ranked, cids, ntype, edges, etype) in enumerate(zip(qids, labels, predictions, preds_ranked, concept_ids, node_type_ids, edge_index, edge_type)):
-                                acc = int(pred.item()==label.item())
-                                print ('{},{}'.format(qid, chr(ord('A') + pred.item())), file=f_preds)
-                                f_preds.flush()
-                                total_acc.append(acc)
-                test_acc = float(sum(total_acc))/len(total_acc)
+                if global_step % args.log_interval == 0:
+                    ms_per_batch = 1000 * (time.time() - start_time) / args.log_interval
+                    avg_loss = total_loss / args.log_interval
+                    if hasattr(scheduler, 'get_last_lr'):
+                        current_lr = scheduler.get_last_lr()[0]
+                    else:
+                        current_lr = scheduler.get_lr()[0]
+                    print('| step {:5} |  lr: {:9.7f} | loss {:7.4f} | ms/batch {:7.2f} |'.format(
+                        global_step, current_lr, avg_loss, ms_per_batch))
+                    total_loss = 0.0
+                    start_time = time.time()
 
+            epoch_avg_loss = epoch_loss / max(1, num_batches)
             print('-' * 71)
-            print('| epoch {:3} | step {:5} | dev_acc {:7.4f} | test_acc {:7.4f} |'.format(epoch_id, global_step, dev_acc, test_acc))
+            print('| epoch {:3} | step {:5} | train_loss {:7.4f} |'.format(epoch_id, global_step, epoch_avg_loss))
             print('-' * 71)
+
             with open(log_path, 'a') as fout:
-                fout.write('{},{},{}\n'.format(global_step, dev_acc, test_acc))
-            if dev_acc >= best_dev_acc:
-                best_dev_acc = dev_acc
-                final_test_acc = test_acc
-                best_dev_epoch = epoch_id
-                if args.save_model:
-                    torch.save([model.state_dict(), args], f"{model_path}.{epoch_id}")
-                    print(f'model saved to {model_path}.{epoch_id}')
-            else:
-                if args.save_model:
-                    torch.save([model.state_dict(), args], f"{model_path}.{epoch_id}")
-                    print(f'model saved to {model_path}.{epoch_id}')
-            model.train()
-            start_time = time.time()
-            if epoch_id > args.unfreeze_epoch and epoch_id - best_dev_epoch >= args.max_epochs_before_stop:
-                break
+                fout.write(f"{global_step},{epoch_avg_loss}\n")
+            if args.save_model:
+                checkpoint_path = f"{model_path}.epoch{epoch_id}"
+                torch.save([model.state_dict(), args], checkpoint_path)
+                print(f'model saved to {checkpoint_path}')
+
 
 
 
 
 def eval_detail(args):
-    assert args.load_model_path is not None
-    model_path = args.load_model_path
-
-    cp_emb = [np.load(path) for path in args.ent_emb_paths]
-    cp_emb = torch.tensor(np.concatenate(cp_emb, 1), dtype=torch.float)
-    concept_num, concept_dim = cp_emb.size(0), cp_emb.size(1)
-    print('| num_concepts: {} |'.format(concept_num))
-
-    model_state_dict, old_args = torch.load(model_path, map_location=torch.device('cpu'))
-    model = JOINT_LM_KG(old_args, old_args.encoder, k=old_args.k, n_ntype=4, n_etype=old_args.num_relation, n_concept=concept_num,
-                               concept_dim=old_args.gnn_dim,
-                               concept_in_dim=concept_dim,
-                               n_attention_head=old_args.att_head_num, fc_dim=old_args.fc_dim, n_fc_layer=old_args.fc_layer_num,
-                               p_emb=old_args.dropouti, p_gnn=old_args.dropoutg, p_fc=old_args.dropoutf,
-                               pretrained_concept_emb=cp_emb, freeze_ent_emb=old_args.freeze_ent_emb,
-                               init_range=old_args.init_range,
-                               encoder_config={})
-    model.load_state_dict(model_state_dict)
-
-    if torch.cuda.device_count() >= 2 and args.cuda:
-        device0 = torch.device("cuda:0")
-        device1 = torch.device("cuda:1")
-    elif torch.cuda.device_count() == 1 and args.cuda:
-        device0 = torch.device("cuda:0")
-        device1 = torch.device("cuda:0")
-    else:
-        device0 = torch.device("cpu")
-        device1 = torch.device("cpu")
-    model.encoder.to(device0)
-    model.decoder.to(device1)
-    model.eval()
-
-    statement_dic = {}
-    for statement_path in (args.train_statements, args.dev_statements, args.test_statements):
-        statement_dic.update(load_statement_dict(statement_path))
-
-    use_contextualized = 'lm' in old_args.ent_emb
-
-    print ('inhouse?', args.inhouse)
-
-    print ('args.train_statements', args.train_statements)
-    print ('args.dev_statements', args.dev_statements)
-    print ('args.test_statements', args.test_statements)
-    print ('args.train_adj', args.train_adj)
-    print ('args.dev_adj', args.dev_adj)
-    print ('args.test_adj', args.test_adj)
-
-    dataset = DataLoader(args, args.train_statements, args.train_adj,
-                                           args.dev_statements, args.dev_adj,
-                                           args.test_statements, args.test_adj,
-                                           batch_size=args.batch_size, eval_batch_size=args.eval_batch_size,
-                                           device=(device0, device1),
-                                           model_name=old_args.encoder,
-                                           max_node_num=old_args.max_node_num, max_seq_length=old_args.max_seq_len,
-                                           is_inhouse=args.inhouse, inhouse_train_qids_path=args.inhouse_train_qids,
-                                           subsample=args.subsample, use_cache=args.use_cache)
-
-    save_test_preds = args.save_model
-    dev_acc = evaluate_accuracy(dataset.dev(), model)
-    print('dev_acc {:7.4f}'.format(dev_acc))
-    if not save_test_preds:
-        test_acc = evaluate_accuracy(dataset.test(), model) if args.test_statements else 0.0
-    else:
-        eval_set = dataset.test()
-        total_acc = []
-        count = 0
-        dt = datetime.datetime.today().strftime('%Y%m%d%H%M%S')
-        preds_path = os.path.join(args.save_dir, 'test_preds_{}.csv'.format(dt))
-        with open(preds_path, 'w') as f_preds:
-            with torch.no_grad():
-                for qids, labels, *input_data in tqdm(eval_set):
-                    count += 1
-                    logits, _, concept_ids, node_type_ids, edge_index, edge_type = model(*input_data, detail=True)
-                    predictions = logits.argmax(1) #[bsize, ]
-                    preds_ranked = (-logits).argsort(1) #[bsize, n_choices]
-                    for i, (qid, label, pred, _preds_ranked, cids, ntype, edges, etype) in enumerate(zip(qids, labels, predictions, preds_ranked, concept_ids, node_type_ids, edge_index, edge_type)):
-                        acc = int(pred.item()==label.item())
-                        print ('{},{}'.format(qid, chr(ord('A') + pred.item())), file=f_preds)
-                        f_preds.flush()
-                        total_acc.append(acc)
-        test_acc = float(sum(total_acc))/len(total_acc)
-
-        print('-' * 71)
-        print('test_acc {:7.4f}'.format(test_acc))
-        print('-' * 71)
+    raise NotImplementedError('Detailed evaluation is not supported in the representation-learning configuration.')
 
 
 
