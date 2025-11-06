@@ -1,0 +1,11 @@
+{
+  "Accident": 0,
+  "Cause": 1,
+  "Company": 2,
+  "Equipment": 3,
+  "Injury": 4,
+  "Location": 5,
+  "Person": 6,
+  "Project": 7,
+  "Report": 8
+}
