@@ -2,34 +2,74 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from transformers import (OPENAI_GPT_PRETRAINED_CONFIG_ARCHIVE_MAP, BERT_PRETRAINED_CONFIG_ARCHIVE_MAP,
-                          XLNET_PRETRAINED_CONFIG_ARCHIVE_MAP, ROBERTA_PRETRAINED_CONFIG_ARCHIVE_MAP)
+from transformers import AutoConfig, AutoModel, BertModel, BertConfig, OpenAIGPTConfig, RobertaConfig, XLNetConfig
+
 try:
-    from transformers import ALBERT_PRETRAINED_CONFIG_ARCHIVE_MAP
-except:
-    pass
+    from transformers import AlbertConfig
+except ImportError:
+    AlbertConfig = None
+
+SUPPORTED_MODEL_TYPES = {'gpt', 'bert', 'xlnet', 'roberta', 'albert', 'lstm'}
+
+
+def _get_pretrained_names(config_cls):
+    archive_map = getattr(config_cls, 'pretrained_config_archive_map', None)
+    if not archive_map:
+        return []
+    if isinstance(archive_map, dict):
+        return list(archive_map.keys())
+    return list(archive_map)
+
 from transformers import AutoModel, BertModel, BertConfig
 from utils.layers import *
 from utils.data_utils import get_gpt_token_num
 
 MODEL_CLASS_TO_NAME = {
-    'gpt': list(OPENAI_GPT_PRETRAINED_CONFIG_ARCHIVE_MAP.keys()),
-    'bert': list(BERT_PRETRAINED_CONFIG_ARCHIVE_MAP.keys()),
-    'xlnet': list(XLNET_PRETRAINED_CONFIG_ARCHIVE_MAP.keys()),
-    'roberta': list(ROBERTA_PRETRAINED_CONFIG_ARCHIVE_MAP.keys()),
+    'gpt': _get_pretrained_names(OpenAIGPTConfig),
+    'bert': _get_pretrained_names(BertConfig),
+    'xlnet': _get_pretrained_names(XLNetConfig),
+    'roberta': _get_pretrained_names(RobertaConfig),
+    'albert': _get_pretrained_names(AlbertConfig) if AlbertConfig is not None else [],
     'lstm': ['lstm'],
 }
-try:
-    MODEL_CLASS_TO_NAME['albert'] =  list(ALBERT_PRETRAINED_CONFIG_ARCHIVE_MAP.keys())
-except:
-    pass
 
-MODEL_NAME_TO_CLASS = {model_name: model_class for model_class, model_name_list in MODEL_CLASS_TO_NAME.items() for model_name in model_name_list}
 
+MODEL_NAME_TO_CLASS = {model_name: model_class
+                       for model_class, model_name_list in MODEL_CLASS_TO_NAME.items()
+                       for model_name in model_name_list}
 #Add SapBERT configuration
-model_name = 'cambridgeltl/SapBERT-from-PubMedBERT-fulltext'
-MODEL_NAME_TO_CLASS[model_name] = 'bert'
+MODEL_NAME_TO_CLASS['cambridgeltl/SapBERT-from-PubMedBERT-fulltext'] = 'bert'
+MODEL_CLASS_TO_NAME.setdefault('bert', []).append('cambridgeltl/SapBERT-from-PubMedBERT-fulltext')
 
+MODEL_TYPE_ALIASES = {
+    'openai-gpt': 'gpt',
+    'gpt': 'gpt',
+    'bert': 'bert',
+    'distilbert': 'bert',
+    'electra': 'bert',
+    'xlnet': 'xlnet',
+    'roberta': 'roberta',
+    'camembert': 'roberta',
+    'albert': 'albert',
+}
+
+
+def resolve_model_class(model_name):
+    if model_name in MODEL_NAME_TO_CLASS:
+        return MODEL_NAME_TO_CLASS[model_name]
+    if model_name == 'lstm':
+        MODEL_NAME_TO_CLASS[model_name] = 'lstm'
+        return 'lstm'
+
+    config = AutoConfig.from_pretrained(model_name)
+    model_type = MODEL_TYPE_ALIASES.get(config.model_type, config.model_type)
+    if model_type not in SUPPORTED_MODEL_TYPES:
+        raise ValueError(f'Unsupported encoder model type "{config.model_type}" resolved as "{model_type}"')
+    MODEL_NAME_TO_CLASS[model_name] = model_type
+    name_list = MODEL_CLASS_TO_NAME.setdefault(model_type, [])
+    if model_name not in name_list:
+        name_list.append(model_name)
+    return model_type
 
 class LSTMTextEncoder(nn.Module):
     pool_layer_classes = {'mean': MeanPoolLayer, 'max': MaxPoolLayer}
@@ -86,11 +126,11 @@ class LSTMTextEncoder(nn.Module):
 
 
 class TextEncoder(nn.Module):
-    valid_model_types = set(MODEL_CLASS_TO_NAME.keys())
+    valid_model_types = SUPPORTED_MODEL_TYPES
 
     def __init__(self, model_name, output_token_states=False, from_checkpoint=None, **kwargs):
         super().__init__()
-        self.model_type = MODEL_NAME_TO_CLASS[model_name]
+        self.model_type = resolve_model_class(model_name)
         self.output_token_states = output_token_states
         assert not self.output_token_states or self.model_type in ('bert', 'roberta', 'albert')
 
@@ -151,3 +191,4 @@ def run_test():
     assert len(outputs[1]) == 4 + 1
     assert all([x.size() == (30, 70, 100 if l == 0 else 200) for l, x in enumerate(outputs[1])])
     print('all tests are passed')
+
