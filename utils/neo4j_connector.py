@@ -1,9 +1,12 @@
-import torch
-from neo4j import GraphDatabase
-from typing import List, Dict, Any, Tuple
-import time
-import json
+"""Utility helpers for connecting to a Neo4j knowledge graph at runtime."""
+
+from __future__ import annotations
+
+from collections import deque
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
+
 import pyahocorasick
+from neo4j import GraphDatabase
 
 
 class Neo4jConnector:
@@ -11,112 +14,156 @@ class Neo4jConnector:
     用于连接 Neo4j、执行实体链接和动态获取子图的类。
     """
 
-    def __init__(self, uri, user, password, grounding_pattern_path):
+    def __init__(
+        self,
+        uri: str,
+        user: str,
+        password: str,
+        grounding_vocab_path: str,
+        *,
+        entity_property: str = "name",
+    ) -> None:
         self.driver = GraphDatabase.driver(uri, auth=(user, password))
-        print("Initializing Neo4j Connector...")
-
-        print(f"Loading grounding vocabulary from {grounding_vocab_path}...")
+        self.entity_property = entity_property
         self.automaton = pyahocorasick.Automaton()
-        try:
+        self._load_grounding_vocabulary(grounding_vocab_path)
+
+        # ------------------------------------------------------------------
+        # Grounding helpers
+        # ------------------------------------------------------------------
+        def _load_grounding_vocabulary(self, grounding_vocab_path: str) -> None:
+            """Populate the Aho–Corasick automaton with entity mentions."""
+
+            loaded = 0
             with open(grounding_vocab_path, "r", encoding="utf8") as fin:
                 for idx, line in enumerate(fin):
-                    entity_name = line.strip()
-                    if entity_name:
-                        # (重要)
-                        # Aho-Corasick 允许我们添加一个 (key, value) 对
-                        # 我们把实体名称 (key) 和它自己 (value) 关联起来
-                        self.automaton.add_word(entity_name, entity_name)
+                    mention = line.strip()
+                    if mention:
+                        self.automaton.add_word(mention, mention)
+                        loaded += 1
 
-            print(f"Loaded {idx + 1} entities into Aho-Corasick automaton.")
-
-            # 构建自动机，使其可用于搜索
             self.automaton.make_automaton()
-            print("Grounding automaton built.")
-
-        except FileNotFoundError:
-            print(f"错误：实体词汇表文件未找到: {grounding_vocab_path}")
-            print("请先运行 utils/build_neo4j_vocab.py 来生成该文件。")
-            raise
-        except Exception as e:
-            print(f"加载自动机时出错: {e}")
-            raise
-
-        def close(self):
-            self.driver.close()
+            print(f"Loaded {loaded} surface forms from {grounding_vocab_path}.")
 
         def link_entities(self, query: str) -> List[str]:
+            """Return the unique entity mentions detected inside ``query``."""
 
+            return sorted({match for _, match in self.automaton.iter(query)})
 
-            mentioned_concepts = set()
+        # ------------------------------------------------------------------
+        # Neo4j traversal helpers
+        # ------------------------------------------------------------------
+        def close(self) -> None:
+            self.driver.close()
 
-            # self.automaton.iter(query)
-            # 会在 query 中查找自动机中的所有(中文)实体
-            # 它返回一个 (end_index, value) 的元组
-            # value 就是我们_添加_的实体名称
+        def _record_to_node_payload(self, node: Any) -> Dict[str, Any]:
+            return {
+                "id": node.element_id,
+                "labels": list(node.labels),
+                "properties": dict(node),
+            }
 
-            for end_index, original_concept in self.automaton.iter(query):
-                # original_concept 已经是 "苹果公司" 或 "史蒂夫 乔布斯"
-                mentioned_concepts.add(original_concept)
+        def _record_to_edge_payload(self, relationship: Any) -> Dict[str, Any]:
+            return {
+                "id": relationship.element_id,
+                "type": relationship.type,
+                "start_node_id": relationship.start_node.element_id,
+                "end_node_id": relationship.end_node.element_id,
+                "properties": dict(relationship),
+            }
 
-            return list(mentioned_concepts)
+        def fetch_subgraph_for_entities(
+                self,
+                entities: Sequence[str],
+                *,
+                hops: int = 1,
+        ) -> Dict[str, Any]:
+            """Fetch an ``hops``-hop subgraph around ``entities``.
 
-        def fetch_subgraph_for_entities(self, entities: List[str], hops: int = 1) -> Dict[str, Any]:
+            The method performs a breadth-first traversal starting from all nodes
+            whose ``entity_property`` matches any of the supplied surface forms.  It
+            returns a dictionary with two keys:
+
+            ``nodes``
+                A list of dictionaries containing the Neo4j ``element_id`` of the
+                node, its labels, and all properties.
+            ``edges``
+                A list describing the traversed relationships.  Each element stores
+                the ``element_id`` of the relationship and the identifiers of the
+                incident nodes.
+            ``mention_node_ids``
+                The subset of node ``element_id`` values that correspond to the
+                grounded entities.  This is convenient when the caller wants to add
+                special edges from the synthetic context node.
             """
-            (已修改 - 简化)
-            为一组种子实体动态获取一个 n-hop 子图。
-            """
+
             if not entities:
-                return {'nodes': [], 'edges': []}
+                return {"nodes": [], "edges": [], "mention_node_ids": []}
 
-            # (重要)
-            # `entities` 列表现在是 ["苹果公司", "史蒂夫 乔布斯"]
-            # 这正是 Neo4j 中 'name' 属性的值。
-
-            query = f"""
-            MATCH (seed)
-            WHERE seed.name IN $entities // (!! 直接使用 $entities !!)
-            // 获取 1-hop 邻居和连接它们的边
-            CALL {{
-                WITH seed
-                MATCH (seed)-[r]-(neighbor)
-                RETURN seed, r, neighbor
-            }}
-            RETURN seed, r, neighbor
-            """
-
-            nodes = {}  # 使用字典去重
-            edges = []
+            entity_set: Set[str] = set(entities)
+            nodes: Dict[str, Dict[str, Any]] = {}
+            edges: List[Dict[str, Any]] = []
+            mention_node_ids: Set[str] = set()
 
             with self.driver.session() as session:
-                # (!! 修改了变量名 !!)
-                results = session.run(query, entities=entities, hops=hops)
+                # Retrieve all seed nodes first.
+                seed_records = session.run(
+                    f"""
+                        MATCH (seed)
+                        WHERE seed.{self.entity_property} IN $entities
+                        RETURN seed
+                        """,
+                    entities=list(entity_set),
+                )
 
-                for record in results:
+                queue: deque = deque()
+                for record in seed_records:
                     seed_node = record["seed"]
-                    rel = record["r"]
-                    neighbor_node = record["neighbor"]
+                    node_payload = self._record_to_node_payload(seed_node)
+                    nodes[node_payload["id"]] = node_payload
+                    queue.append((node_payload["id"], 0))
+                    if node_payload["properties"].get(self.entity_property) in entity_set:
+                        mention_node_ids.add(node_payload["id"])
+
+                visited: Set[str] = set()
+
+                while queue:
+                    current_id, depth = queue.popleft()
+                    if current_id in visited or depth >= hops:
+                        visited.add(current_id)
+                        continue
+                    visited.add(current_id)
+
+                    records = session.run(
+                        """
+                        MATCH (seed)-[rel]-(neighbor)
+                        WHERE elementId(seed) = $seed_id
+                        RETURN seed, rel, neighbor
+                        """,
+                        seed_id=current_id,
+                    )
+
+                    for record in records:
+                        rel = record["rel"]
+                        neighbor = record["neighbor"]
+
+                        neighbor_payload = self._record_to_node_payload(neighbor)
+                        neighbor_id = neighbor_payload["id"]
+                        if neighbor_id not in nodes:
+                            nodes[neighbor_id] = neighbor_payload
+                            queue.append((neighbor_id, depth + 1))
+                            if neighbor_payload["properties"].get(self.entity_property) in entity_set:
+                                mention_node_ids.add(neighbor_id)
+
+                        edges.append(self._record_to_edge_payload(rel))
+
+            return {
+                "nodes": list(nodes.values()),
+                "edges": edges,
+                "mention_node_ids": list(mention_node_ids),
+            }
 
 
-                    # 处理节点 (包含属性和类型)
-                    for node in [seed_node, neighbor_node]:
-                        node_id = node.element_id
-                        if node_id not in nodes:
-                            nodes[node_id] = {
-                                'id': node.element_id,
-                                'labels': list(node.labels),  # 英文
-                                'properties': dict(node)  # 包含 'name' (中文)
-                            }
-
-                    # 处理边 (包含属性和类型)
-                    edges.append({
-                        'id': rel.element_id,
-                        'type': rel.type,  # 英文
-                        'start_node_id': rel.start_node.element_id,
-                        'end_node_id': rel.end_node.element_id,
-                        'properties': dict(rel)
-                    })
-
-            return {'nodes': list(nodes.values()), 'edges': edges}
-
+__all__ = ["Neo4jConnector"]
 
 
