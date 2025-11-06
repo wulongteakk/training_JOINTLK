@@ -1,11 +1,53 @@
-"""Utility helpers for connecting to a Neo4j knowledge graph at runtime."""
-
 from __future__ import annotations
 
 from collections import deque
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
-import pyahocorasick
+try:  # pragma: no cover - optional dependency runtime check
+    import pyahocorasick  # type: ignore
+    _PYAHO_AVAILABLE = True
+except ModuleNotFoundError:  # pragma: no cover - fallback branch
+    _PYAHO_AVAILABLE = False
+
+    class _FallbackAutomaton:
+        """Minimal substring matcher used when ``pyahocorasick`` is missing.
+
+        The fallback keeps an in-memory list of surface forms and performs a
+        naive ``str.find`` scan over the input text.  Although this is slower
+        than the automaton-based approach, it preserves the same public API so
+        that downstream code can continue to call ``iter`` and receive
+        ``(end_index, value)`` tuples.
+        """
+
+        def __init__(self) -> None:
+            self._keywords: List[Tuple[str, str]] = []
+
+        def add_word(self, word: str, value: str) -> None:
+            self._keywords.append((word, value))
+
+        def make_automaton(self) -> None:  # noqa: D401 - interface parity
+            """No-op to mirror :mod:`pyahocorasick` initialisation."""
+
+        def iter(self, text: str):  # type: ignore[override]
+            for word, value in self._keywords:
+                start = 0
+                while True:
+                    idx = text.find(word, start)
+                    if idx == -1:
+                        break
+                    yield idx + len(word) - 1, value
+                    start = idx + 1
+
+    class _PyAhoNamespace:
+        Automaton = _FallbackAutomaton
+
+    pyahocorasick = _PyAhoNamespace()  # type: ignore
+    print(
+        "[neo4j_connector] pyahocorasick module not found; "
+        "falling back to a slow Python matcher. Install 'pyahocorasick' "
+        "for optimal performance."
+    )
+
 from neo4j import GraphDatabase
 
 
@@ -165,5 +207,6 @@ class Neo4jConnector:
 
 
 __all__ = ["Neo4jConnector"]
+
 
 
