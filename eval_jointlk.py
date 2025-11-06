@@ -19,6 +19,7 @@ DECODER_DEFAULT_LR = {
     'csqa': 1e-3,
     'obqa': 3e-4,
     'medqa_usmle': 1e-3,
+    'construction': 1e-3,
 }
 
 from collections import defaultdict, OrderedDict
@@ -46,10 +47,11 @@ def evaluate_accuracy(eval_set, model):
 def main():
     parser = get_parser()
     args, _ = parser.parse_known_args()
+    dataset_overrides = get_dataset_overrides(args.dataset)
     parser.add_argument('--mode', default='eval_detail', choices=['train', 'eval_detail'], help='run training or evaluation')
     parser.add_argument('--save_dir', default=f'./saved_models/', help='model output directory')
     parser.add_argument('--save_model', dest='save_model', action='store_true')
-    parser.add_argument('--load_model_path', default=None)
+    parser.add_argument('--load_model_path', default=dataset_overrides.get('load_model_path'))
 
 
     # data
